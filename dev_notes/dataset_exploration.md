@@ -7,6 +7,7 @@ and explore it. Follow the steps in order.
 
 ## Repo Structure
 
+```
 MarsDEMNet/
 ├── data/
 │   ├── download_data.sh       # script to download MCTED from HuggingFace
@@ -17,6 +18,7 @@ MarsDEMNet/
 │   └── dataset_exploration.ipynb  # dataset exploration notebook
 ├── requirements.txt           # all project dependencies
 └── venv/                      # your local virtual environment (not committed to git)
+```
 
 ---
 
