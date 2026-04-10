@@ -151,3 +151,5 @@ if tars_dir.exists():
 print(f"Sample extraction complete → {extract_dir}")
 EOF
 fi
+
+rm -f "$DATA_DIR/README.md"
