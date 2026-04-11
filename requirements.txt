@@ -1,0 +1,6 @@
+# Data pipeline
+huggingface_hub
+numpy
+Pillow
+matplotlib
+scipy
