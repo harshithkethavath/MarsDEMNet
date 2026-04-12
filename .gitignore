@@ -1,3 +1,5 @@
 *.cache
 data/sample/
+data/train/
+data/val/
 venv/
