@@ -1,6 +1,9 @@
-# Data pipeline
 huggingface_hub
 numpy
 Pillow
 matplotlib
 scipy
+scikit-image
+tifffile
+scikit-learn
+opencv-python
