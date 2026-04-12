@@ -1,0 +1,32 @@
+{
+  "elev_std": {
+    "best_params": {
+      "max_depth": 20,
+      "n_estimators": 200
+    },
+    "train_mae": 19.8554,
+    "train_rmse": 27.344,
+    "val_mae": 41.2931,
+    "val_rmse": 58.3944
+  },
+  "elev_mean": {
+    "best_params": {
+      "max_depth": 20,
+      "n_estimators": 200
+    },
+    "train_mae": 0.4513,
+    "train_rmse": 0.8047,
+    "val_mae": 0.5416,
+    "val_rmse": 1.1864
+  },
+  "slope_dir": {
+    "best_params": {
+      "max_depth": 20,
+      "n_estimators": 200
+    },
+    "train_mae": 26.5287,
+    "train_rmse": 32.1248,
+    "val_mae": 43.5922,
+    "val_rmse": 51.1042
+  }
+}
