@@ -3,3 +3,7 @@ data/sample/
 data/train/
 data/val/
 venv/
+__pycache__
+sub.sh
+*.pkl
+logs/
