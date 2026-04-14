@@ -2,33 +2,20 @@
 data/dataset.py
 
 MCTEDDataset — PyTorch Dataset for the MCTED patch dataset.
+Supports three backends:
 
-Reads raw patch files from disk on demand. Produces nothing permanent.
-Each __getitem__ call loads four raw files, applies validity masking,
-normalization, optional auxiliary label generation (slope + roughness),
-and optional augmentation, then returns a tensor dict.
+    files  — reads raw patch files from disk on demand (slow on Lustre)
+    hdf5   — reads from a pre-built .h5 file
+    ram    — loads entire dataset into RAM at init, zero disk I/O per epoch
 
-Expected directory layout (flat, no subdirectories):
-    <root_dir>/
-        <scene_pair>_<patch_idx>.optical.png
-        <scene_pair>_<patch_idx>.elevation.tif
-        <scene_pair>_<patch_idx>.initial_nan_mask.png
-        <scene_pair>_<patch_idx>.deviation_mask.png
-        ...
+Backend is auto-detected:
+    root_dir ends with .h5  → hdf5
+    cache=True              → ram (loads from directory into RAM at init)
+    otherwise               → files
 
-Usage:
-    from data.dataset import MCTEDDataset
-    from torch.utils.data import DataLoader
-
-    # Training (Implementation 2 — single output)
-    train_ds = MCTEDDataset("data/train/", augment=True)
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4)
-
-    # Validation
-    val_ds = MCTEDDataset("data/val/", augment=False)
-
-    # Training (Implementation 3 — multi-output, needs slope + roughness)
-    train_ds = MCTEDDataset("data/train/", augment=True, compute_auxiliary=True)
+RAM backend is strongly recommended on cluster nodes with >256GB RAM.
+Pays a one-time load cost (~10-30 min from Lustre) then runs at memory
+speed for all subsequent epochs with zero filesystem overhead.
 """
 
 import os
@@ -43,33 +30,25 @@ from scipy.ndimage import sobel, gaussian_filter
 
 class MCTEDDataset(Dataset):
     """
-    Live reader for MCTED patch quads.
-
     Args:
         root_dir (str):
-            Path to extracted patch directory — either data/train/ or data/val/.
-            The caller decides which split to use; this class is split-agnostic.
+            Path to an HDF5 file (data/train.h5) or a directory (data/train/).
 
         augment (bool):
-            If True, applies random horizontal flip, vertical flip, and 90-degree
-            rotation. All transforms are applied identically to the optical image,
-            DEM patch, and validity mask in lock-step. Set True for training only.
+            Random horizontal flip, vertical flip, 90-degree rotation.
+            Applied identically to optical, DEM, and validity mask.
 
         compute_auxiliary (bool):
-            If True, computes slope and roughness from the DEM and includes them
-            in the returned dict as "slope" and "roughness" tensors. Required for
-            Implementations 3 and 4. Skip for Implementations 1 and 2 to avoid
-            unnecessary computation.
+            If True, computes slope and roughness from the DEM.
+            Required for Implementations 3 and 4.
 
-        pixel_size_m (float):
-            Ground sampling distance in meters per pixel. CTX is 6.0 m/pixel.
-            Used when computing slope gradient — affects the physical scale of
-            the slope output (degrees) but not elevation or roughness.
+        cache (bool):
+            If True and root_dir is a directory, loads all raw arrays into RAM
+            at __init__ time. After loading, __getitem__ never touches disk.
+            Recommended on nodes with >= 256GB RAM.
 
-        roughness_window (int):
-            Side length of the local smoothing window used to compute roughness.
-            Default 5 pixels = 30 meters at CTX resolution. Roughness is defined
-            as the absolute deviation of each pixel from its local mean elevation.
+        pixel_size_m (float): CTX ground sampling distance in m/pixel.
+        roughness_window (int): Local smoothing window for roughness (pixels).
     """
 
     def __init__(
@@ -77,219 +56,194 @@ class MCTEDDataset(Dataset):
         root_dir: str,
         augment: bool = False,
         compute_auxiliary: bool = False,
+        cache: bool = False,
         pixel_size_m: float = 6.0,
         roughness_window: int = 5,
     ):
-        self.root_dir = root_dir
-        self.augment = augment
+        self.root_dir          = root_dir
+        self.augment           = augment
         self.compute_auxiliary = compute_auxiliary
-        self.pixel_size_m = pixel_size_m
-        self.roughness_window = roughness_window
+        self.pixel_size_m      = pixel_size_m
+        self.roughness_window  = roughness_window
 
-        # ------------------------------------------------------------------
-        # Build patch index by scanning for .optical.png files.
-        # .optical.png is the canonical anchor: every valid patch has one.
-        # Sorting guarantees identical index order across runs and OS/FS types.
-        # ------------------------------------------------------------------
-        all_files = os.listdir(root_dir)
+        if root_dir.endswith(".h5"):
+            self._backend = "hdf5"
+            self._init_hdf5(root_dir)
+        elif cache:
+            self._backend = "ram"
+            self._init_files(root_dir)
+            self._load_into_ram()
+        else:
+            self._backend = "files"
+            self._init_files(root_dir)
+
+    # ------------------------------------------------------------------
+    # Backend initialisation
+    # ------------------------------------------------------------------
+
+    def _init_hdf5(self, path):
+        import h5py
+        with h5py.File(path, "r") as f:
+            self.patch_ids = [
+                pid.decode() if isinstance(pid, bytes) else pid
+                for pid in f["patch_ids"][:]
+            ]
+        self._h5_path = path
+        self._h5_file = None  # opened lazily per worker
+
+    def _init_files(self, root_dir):
+        all_files      = os.listdir(root_dir)
         self.patch_ids = sorted(
-            f[: -len(".optical.png")]
-            for f in all_files
-            if f.endswith(".optical.png")
+            f[:-len(".optical.png")]
+            for f in all_files if f.endswith(".optical.png")
+        )
+        if not self.patch_ids:
+            raise ValueError(f"No .optical.png files found in {root_dir}.")
+
+    def _load_into_ram(self):
+        """
+        One-time load of all raw arrays into RAM numpy arrays.
+        Progress printed to stdout so SLURM logs show it.
+        """
+        N = len(self.patch_ids)
+        print(f"[MCTEDDataset] Loading {N:,} patches into RAM from {self.root_dir} ...")
+
+        self._cache_optical   = np.empty((N, 518, 518), dtype=np.uint8)
+        self._cache_elevation = np.empty((N, 518, 518), dtype=np.float32)
+        self._cache_nan_mask  = np.empty((N, 518, 518), dtype=np.uint8)
+        self._cache_dev_mask  = np.empty((N, 518, 518), dtype=np.uint8)
+
+        for i, patch_id in enumerate(self.patch_ids):
+            base = os.path.join(self.root_dir, patch_id)
+            self._cache_optical[i]   = np.array(Image.open(f"{base}.optical.png").convert("L"), dtype=np.uint8)
+            self._cache_elevation[i] = tifffile.imread(f"{base}.elevation.tif").astype(np.float32)
+            self._cache_nan_mask[i]  = np.array(Image.open(f"{base}.initial_nan_mask.png").convert("L"), dtype=np.uint8)
+            self._cache_dev_mask[i]  = np.array(Image.open(f"{base}.deviation_mask.png").convert("L"), dtype=np.uint8)
+
+            if (i + 1) % 5000 == 0:
+                print(f"[MCTEDDataset]   {i+1:,}/{N:,} patches loaded")
+
+        mem_gb = (self._cache_optical.nbytes + self._cache_elevation.nbytes +
+                  self._cache_nan_mask.nbytes + self._cache_dev_mask.nbytes) / 1e9
+        print(f"[MCTEDDataset] Cache ready. RAM used: {mem_gb:.1f} GB")
+
+    # ------------------------------------------------------------------
+    # Raw loading — one method per backend
+    # ------------------------------------------------------------------
+
+    def _load_hdf5(self, idx):
+        if self._h5_file is None:
+            import h5py
+            self._h5_file = h5py.File(self._h5_path, "r")
+        return (
+            self._h5_file["optical"][idx].astype(np.float32),
+            self._h5_file["elevation"][idx].astype(np.float32),
+            self._h5_file["nan_mask"][idx],
+            self._h5_file["dev_mask"][idx],
         )
 
-        if len(self.patch_ids) == 0:
-            raise ValueError(
-                f"No .optical.png files found in {root_dir}. "
-                "Check that the dataset has been extracted correctly."
-            )
+    def _load_ram(self, idx):
+        return (
+            self._cache_optical[idx].astype(np.float32),
+            self._cache_elevation[idx].copy(),
+            self._cache_nan_mask[idx],
+            self._cache_dev_mask[idx],
+        )
 
-    def __len__(self) -> int:
+    def _load_files(self, idx):
+        patch_id = self.patch_ids[idx]
+        base     = os.path.join(self.root_dir, patch_id)
+        return (
+            np.array(Image.open(f"{base}.optical.png").convert("L"), dtype=np.float32),
+            tifffile.imread(f"{base}.elevation.tif").astype(np.float32),
+            np.array(Image.open(f"{base}.initial_nan_mask.png").convert("L"), dtype=np.uint8),
+            np.array(Image.open(f"{base}.deviation_mask.png").convert("L"),   dtype=np.uint8),
+        )
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
+
+    def __len__(self):
         return len(self.patch_ids)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx):
         patch_id = self.patch_ids[idx]
-        base = os.path.join(self.root_dir, patch_id)
 
-        # ------------------------------------------------------------------
-        # 1. Load raw files
-        # ------------------------------------------------------------------
+        if self._backend == "hdf5":
+            optical, elevation, nan_mask, dev_mask = self._load_hdf5(idx)
+        elif self._backend == "ram":
+            optical, elevation, nan_mask, dev_mask = self._load_ram(idx)
+        else:
+            optical, elevation, nan_mask, dev_mask = self._load_files(idx)
 
-        # Optical: saved as RGB but all channels identical — convert to L
-        # immediately to discard the two redundant channels and halve memory.
-        optical = np.array(
-            Image.open(f"{base}.optical.png").convert("L"),
-            dtype=np.float32,
-        )  # (518, 518)
-
-        # Elevation: float32 TIF — must use tifffile, not PIL.
-        # PIL silently converts float32 to uint8 and destroys the data.
-        elevation = tifffile.imread(f"{base}.elevation.tif").astype(np.float32)
-        # (518, 518), values in meters above Martian areoid
-
-        # Validity masks: uint8, 0 = valid, 255 = invalid
-        nan_mask = np.array(
-            Image.open(f"{base}.initial_nan_mask.png").convert("L"),
-            dtype=np.uint8,
-        )
-        dev_mask = np.array(
-            Image.open(f"{base}.deviation_mask.png").convert("L"),
-            dtype=np.uint8,
-        )
-
-        # ------------------------------------------------------------------
-        # 2. Combined validity mask
-        # A pixel is valid only if it passes BOTH quality gates.
-        # Shape: (518, 518), dtype bool, True = valid.
-        # Used for masked loss during training and masked metrics at eval.
-        # ------------------------------------------------------------------
+        # Validity mask
         valid_mask = (nan_mask == 0) & (dev_mask == 0)
 
-        # ------------------------------------------------------------------
-        # 3. Optical normalization
-        #    Step 1 — percentile clip: removes hot pixels and cosmic ray
-        #             artifacts before statistics are computed. Clipping at
-        #             2nd/98th rather than min/max prevents a single bright
-        #             speck from compressing the entire dynamic range.
-        #    Step 2 — z-score per patch: handles the large variation in
-        #             illumination angle and surface albedo across Mars.
-        #             Global statistics would be wrong here.
-        # ------------------------------------------------------------------
-        p_low = np.percentile(optical, 2)
-        p_high = np.percentile(optical, 98)
+        # Optical normalisation
+        p_low, p_high = np.percentile(optical, 2), np.percentile(optical, 98)
         optical = np.clip(optical, p_low, p_high)
-
-        mu = optical.mean()
-        sigma = optical.std()
+        mu, sigma = optical.mean(), optical.std()
         if sigma < 1e-6:
-            # Fully uniform patch (fill region or sensor artifact).
-            # Warn once — these patches carry no texture signal.
-            warnings.warn(
-                f"Patch {patch_id} has near-zero optical std ({sigma:.2e}). "
-                "Normalization will produce a zero tensor.",
-                RuntimeWarning,
-            )
+            warnings.warn(f"Patch {patch_id} near-zero optical std.", RuntimeWarning)
             sigma = 1.0
         optical = (optical - mu) / sigma
 
-        # ------------------------------------------------------------------
-        # 4. DEM normalization
-        #    Subtract per-patch mean → relative topography (terrain shape).
-        #    Do NOT divide by std — keeps units in meters so MAE and RMSE
-        #    remain physically interpretable.
-        #    Store the mean so absolute elevation can be reconstructed at
-        #    inference: predicted_absolute = predicted_relative + dem_mean.
-        # ------------------------------------------------------------------
-        dem_mean = float(elevation.mean())
-        elevation = elevation - dem_mean  # now in meters, relative to patch mean
+        # DEM normalisation
+        dem_mean  = float(elevation.mean())
+        elevation = elevation - dem_mean
 
-        # ------------------------------------------------------------------
-        # 5. Auxiliary label generation (slope + roughness)
-        #    Computed from the normalized DEM — so outputs are also relative.
-        #    Only runs when compute_auxiliary=True (Implementations 3 and 4).
-        #    On-the-fly computation avoids storing ~100GB of precomputed files.
-        #    np.gradient on 518x518 float32 takes < 1ms — negligible vs I/O.
-        # ------------------------------------------------------------------
-        slope = None
-        roughness = None
+        # Auxiliary labels
+        slope, roughness = None, None
         if self.compute_auxiliary:
-            # Sobel computes gradients over a 3x3 neighborhood before differencing,
-            # making slope estimates robust to pixel-scale stereo reconstruction noise.
-            # The /8 factor normalizes the Sobel kernel weight so output is in
-            # meters/meter, consistent with pixel_size_m scaling.
             gx = sobel(elevation, axis=1) / (8 * self.pixel_size_m)
             gy = sobel(elevation, axis=0) / (8 * self.pixel_size_m)
-            slope = np.degrees(np.arctan(np.sqrt(gx**2 + gy**2))).astype(np.float32)
-            # slope: (518, 518), degrees [0, 90)
-
-            # Gaussian filter weights nearby pixels more than distant ones when
-            # computing local mean, producing smoother roughness maps with fewer
-            # blocky artifacts than a uniform box filter.
-            # sigma = roughness_window / 2.0, so default window=5 gives sigma=2.5,
-            # an effective neighborhood of ~15 meters at CTX resolution.
+            slope      = np.degrees(np.arctan(np.sqrt(gx**2 + gy**2))).astype(np.float32)
             local_mean = gaussian_filter(elevation, sigma=self.roughness_window / 2.0)
-            roughness = np.abs(elevation - local_mean).astype(np.float32)
-            # roughness: (518, 518), meters (absolute deviation from Gaussian local mean)
+            roughness  = np.abs(elevation - local_mean).astype(np.float32)
 
-        # ------------------------------------------------------------------
-        # 6. Augmentation (training only, augment=False for val/inference)
-        #    All transforms applied identically to optical, elevation, and
-        #    valid_mask using the same random state. Applying a flip to the
-        #    image but not the DEM would misalign the supervision signal.
-        #    Only geometric transforms — brightness jitter on the DEM would
-        #    corrupt the physical elevation values.
-        # ------------------------------------------------------------------
+        # Augmentation
         if self.augment:
             optical, elevation, valid_mask, slope, roughness = _augment(
                 optical, elevation, valid_mask, slope, roughness
             )
 
-        # ------------------------------------------------------------------
-        # 7. Convert to tensors
-        #    unsqueeze(0) adds the channel dimension: (H,W) -> (1,H,W).
-        #    Conv2d expects (C,H,W); single-channel inputs have C=1.
-        #    valid_mask stays (H,W) bool — used for boolean indexing in loss.
-        # ------------------------------------------------------------------
+        # To tensors
         sample = {
-            "optical":  torch.from_numpy(optical).float().unsqueeze(0),    # (1,518,518)
-            "dem":      torch.from_numpy(elevation).float().unsqueeze(0),  # (1,518,518)
-            "valid":    torch.from_numpy(valid_mask.astype(np.uint8)).bool(),  # (518,518)
-            "dem_mean": dem_mean,   # float, meters — for absolute reconstruction
-            "patch_id": patch_id,  # str — for debugging and error logging
+            "optical":  torch.from_numpy(optical).float().unsqueeze(0),
+            "dem":      torch.from_numpy(elevation).float().unsqueeze(0),
+            "valid":    torch.from_numpy(valid_mask.astype(np.uint8)).bool(),
+            "dem_mean": dem_mean,
+            "patch_id": patch_id,
         }
-
         if self.compute_auxiliary:
-            sample["slope"]     = torch.from_numpy(slope).float().unsqueeze(0)     # (1,518,518)
-            sample["roughness"] = torch.from_numpy(roughness).float().unsqueeze(0) # (1,518,518)
+            sample["slope"]     = torch.from_numpy(slope).float().unsqueeze(0)
+            sample["roughness"] = torch.from_numpy(roughness).float().unsqueeze(0)
 
         return sample
 
 
 # ------------------------------------------------------------------------------
-# Augmentation helper (module-level, not a method — keeps __getitem__ readable)
+# Augmentation helper
 # ------------------------------------------------------------------------------
 
 def _augment(optical, elevation, valid_mask, slope, roughness):
-    """
-    Apply random geometric augmentations identically across all arrays.
-
-    Operations:
-        - Random horizontal flip (p=0.5)
-        - Random vertical flip (p=0.5)
-        - Random 90-degree rotation: 0, 90, 180, or 270 degrees (uniform)
-
-    All arrays are numpy, all 2D (H, W). Returns same types and shapes.
-    slope and roughness may be None if compute_auxiliary=False.
-    """
-    # One shared RNG call sequence — same decisions applied to all arrays
     if np.random.rand() > 0.5:
-        optical    = np.fliplr(optical)
-        elevation  = np.fliplr(elevation)
-        valid_mask = np.fliplr(valid_mask)
+        optical, elevation, valid_mask = np.fliplr(optical), np.fliplr(elevation), np.fliplr(valid_mask)
         if slope is not None:
-            slope     = np.fliplr(slope)
-            roughness = np.fliplr(roughness)
+            slope, roughness = np.fliplr(slope), np.fliplr(roughness)
 
     if np.random.rand() > 0.5:
-        optical    = np.flipud(optical)
-        elevation  = np.flipud(elevation)
-        valid_mask = np.flipud(valid_mask)
+        optical, elevation, valid_mask = np.flipud(optical), np.flipud(elevation), np.flipud(valid_mask)
         if slope is not None:
-            slope     = np.flipud(slope)
-            roughness = np.flipud(roughness)
+            slope, roughness = np.flipud(slope), np.flipud(roughness)
 
-    k = np.random.randint(0, 4)  # 0=0°, 1=90°, 2=180°, 3=270°
+    k = np.random.randint(0, 4)
     if k > 0:
-        optical    = np.rot90(optical,    k)
-        elevation  = np.rot90(elevation,  k)
-        valid_mask = np.rot90(valid_mask, k)
+        optical, elevation, valid_mask = np.rot90(optical, k), np.rot90(elevation, k), np.rot90(valid_mask, k)
         if slope is not None:
-            slope     = np.rot90(slope,     k)
-            roughness = np.rot90(roughness, k)
+            slope, roughness = np.rot90(slope, k), np.rot90(roughness, k)
 
-    # np.flip and np.rot90 return views with negative strides.
-    # np.ascontiguousarray forces a copy with normal memory layout,
-    # which torch.from_numpy requires.
     optical    = np.ascontiguousarray(optical)
     elevation  = np.ascontiguousarray(elevation)
     valid_mask = np.ascontiguousarray(valid_mask)

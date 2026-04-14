@@ -4,6 +4,7 @@ data/train/
 data/val/
 venv/
 __pycache__
-sub.sh
+sub*.sh
 *.pkl
 logs/
+*.pt
