@@ -8,3 +8,4 @@ sub*.sh
 *.pkl
 logs/
 *.pt
+.DS_Store
